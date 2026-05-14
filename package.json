@@ -1,0 +1,39 @@
+{
+  "name": "agent-be-gone",
+  "version": "0.1.0",
+  "description": "Scrub AI coding agents (Copilot, Claude, Cursor, Devin, ...) from your git history — authors, committers, and Co-authored-by trailers.",
+  "type": "module",
+  "bin": {
+    "agent-be-gone": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "git",
+    "history",
+    "rewrite",
+    "copilot",
+    "claude",
+    "cursor",
+    "ai",
+    "agent",
+    "co-authored-by",
+    "filter-branch"
+  ],
+  "author": "Johann Berger",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JohnDeved/agent-be-gone.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JohnDeved/agent-be-gone/issues"
+  },
+  "homepage": "https://github.com/JohnDeved/agent-be-gone#readme"
+}

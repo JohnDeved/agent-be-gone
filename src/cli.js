@@ -41,38 +41,47 @@ const BUILTIN_PATTERNS = [
   '\\bllm\\b',
 ]
 
-function parseArgs (argv) {
-  const args = {
-    dryRun: false,
-    yes: false,
-    push: false,
-    branch: null,
-    all: false,
-    name: null,
-    email: null,
-    extra: [],
-    only: null,
-    help: false,
+const FLAG_SPEC = [
+  { keys: ['-h', '--help'], field: 'help', kind: 'bool' },
+  { keys: ['-n', '--dry-run'], field: 'dryRun', kind: 'bool' },
+  { keys: ['-y', '--yes'], field: 'yes', kind: 'bool' },
+  { keys: ['--push'], field: 'push', kind: 'bool' },
+  { keys: ['--all'], field: 'all', kind: 'bool' },
+  { keys: ['--branch'], field: 'branch', kind: 'value' },
+  { keys: ['--name'], field: 'name', kind: 'value' },
+  { keys: ['--email'], field: 'email', kind: 'value' },
+  { keys: ['--add'], field: 'extra', kind: 'append' },
+  { keys: ['--only'], field: 'only', kind: 'csv' },
+]
+
+function defaultArgs () {
+  return {
+    dryRun: false, yes: false, push: false, branch: null, all: false,
+    name: null, email: null, extra: [], only: null, help: false,
   }
+}
+
+const FLAG_HANDLERS = {
+  bool: (args, spec) => { args[spec.field] = true; return 0 },
+  value: (args, spec, argv, i) => { args[spec.field] = argv[i + 1]; return 1 },
+  append: (args, spec, argv, i) => { args[spec.field].push(argv[i + 1]); return 1 },
+  csv: (args, spec, argv, i) => {
+    args[spec.field] = (argv[i + 1] ?? '').split(',').map(s => s.trim()).filter(Boolean)
+    return 1
+  },
+}
+
+function rejectUnknownFlag (token) {
+  if (token.startsWith('-')) { console.error(`Unknown flag: ${token}`); process.exit(2) }
+}
+
+function parseArgs (argv) {
+  const args = defaultArgs()
+  const byKey = new Map(FLAG_SPEC.flatMap(s => s.keys.map(k => [k, s])))
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    switch (a) {
-      case '-h':
-      case '--help': args.help = true; break
-      case '-n':
-      case '--dry-run': args.dryRun = true; break
-      case '-y':
-      case '--yes': args.yes = true; break
-      case '--push': args.push = true; break
-      case '--all': args.all = true; break
-      case '--branch': args.branch = argv[++i]; break
-      case '--name': args.name = argv[++i]; break
-      case '--email': args.email = argv[++i]; break
-      case '--add': args.extra.push(argv[++i]); break
-      case '--only': args.only = (argv[++i] ?? '').split(',').map(s => s.trim()).filter(Boolean); break
-      default:
-        if (a.startsWith('-')) { console.error(`Unknown flag: ${a}`); process.exit(2) }
-    }
+    const spec = byKey.get(argv[i])
+    if (!spec) { rejectUnknownFlag(argv[i]); continue }
+    i += FLAG_HANDLERS[spec.kind](args, spec, argv, i)
   }
   return args
 }
@@ -262,6 +271,82 @@ function cleanupBackups () {
   spawnSync('git', ['gc', '--prune=now', '--quiet'], { stdio: 'ignore' })
 }
 
+function gitConfig (key) {
+  return gitOk(['config', key]) ? git(['config', key]) : null
+}
+
+function failIdentity () {
+  console.error('error: cannot determine replacement identity. Pass --name and --email, or set git config user.name / user.email.')
+  process.exit(1)
+}
+
+function resolveIdentity (args) {
+  const name = args.name ?? gitConfig('user.name')
+  const email = args.email ?? gitConfig('user.email')
+  if (!args.dryRun && !(name && email)) failIdentity()
+  return { name, email }
+}
+
+function resolveScope (args) {
+  if (args.all) return { branch: null, range: '--all', refs: ['--all'], label: 'ALL refs' }
+  const branch = args.branch ?? git(['rev-parse', '--abbrev-ref', 'HEAD'])
+  if (!branch || branch === 'HEAD') {
+    console.error('error: cannot determine current branch. Use --branch <name> or --all.')
+    process.exit(1)
+  }
+  return { branch, range: branch, refs: [branch], label: `branch "${branch}"` }
+}
+
+function describeAffected (c) {
+  const tags = []
+  if (c.inAuthor) tags.push('author')
+  if (c.inCommitter) tags.push('committer')
+  if (c.matchedTrailers.length) tags.push(`${c.matchedTrailers.length} trailer${c.matchedTrailers.length > 1 ? 's' : ''}`)
+  const subject = c.body.split('\n')[0]
+  return `  ${c.hash.slice(0, 8)}  [${tags.join(', ')}]  ${c.an} <${c.ae}>  —  ${subject}`
+}
+
+function printPlan ({ scope, patterns, identity, commits, affected }) {
+  console.log('agent-be-gone')
+  console.log(`  scope:        ${scope.label}`)
+  console.log(`  patterns:     ${patterns.join(', ')}`)
+  console.log(`  replace with: ${identity.name} <${identity.email}>`)
+  console.log(`  scanned:      ${commits.length} commit(s)`)
+  console.log(`  affected:     ${affected.length} commit(s)`)
+  console.log()
+  for (const c of affected) console.log(describeAffected(c))
+  if (affected.length > 0) console.log()
+}
+
+function pushIfRequested (args, scope) {
+  if (!args.push) {
+    console.log('Next: review with `git log`, then `git push --force` when ready.')
+    return
+  }
+  const target = args.all ? '--all' : scope.branch
+  console.log(`Pushing (force) → origin ${target}`)
+  const r = spawnSync('git', ['push', '--force', 'origin', target], { stdio: 'inherit' })
+  if (r.status !== 0) {
+    console.error('error: git push failed')
+    process.exit(r.status ?? 1)
+  }
+}
+
+async function shouldProceed (args, scope, affected) {
+  if (affected.length === 0) { console.log('Nothing to do — history is already clean. ✨'); return false }
+  if (args.dryRun) { console.log('Dry run — no changes made.'); return false }
+  if (args.yes) return true
+  const ok = await confirm(`Rewrite ${affected.length} commit(s) on ${scope.label}?`)
+  if (!ok) console.log('Aborted.')
+  return ok
+}
+
+function reportPostRewrite (range, re, originalCount) {
+  const after = findAffected(listCommits(range), re)
+  if (after.length === 0) console.log(`✓ History scrubbed. ${originalCount} commit(s) rewritten.`)
+  else console.log(`⚠ ${after.length} commit(s) still match after rewrite — review manually.`)
+}
+
 async function main () {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) { printHelp(); return }
@@ -269,88 +354,22 @@ async function main () {
   ensureRepo()
   if (!args.dryRun) ensureClean()
 
-  const name = args.name ?? (gitOk(['config', 'user.name']) ? git(['config', 'user.name']) : null)
-  const email = args.email ?? (gitOk(['config', 'user.email']) ? git(['config', 'user.email']) : null)
-  if (!args.dryRun && (!name || !email)) {
-    console.error('error: cannot determine replacement identity. Pass --name and --email, or set git config user.name / user.email.')
-    process.exit(1)
-  }
-
-  const branch = args.all
-    ? null
-    : args.branch ?? git(['rev-parse', '--abbrev-ref', 'HEAD'])
-  const range = args.all ? '--all' : branch
-  if (!args.all && (!branch || branch === 'HEAD')) {
-    console.error('error: cannot determine current branch. Use --branch <name> or --all.')
-    process.exit(1)
-  }
-
-  const basePatterns = args.only ?? BUILTIN_PATTERNS
-  const patterns = [...basePatterns, ...args.extra]
+  const identity = resolveIdentity(args)
+  const scope = resolveScope(args)
+  const patterns = [...(args.only ?? BUILTIN_PATTERNS), ...args.extra]
   const re = buildRegex(patterns)
 
-  const commits = listCommits(range)
+  const commits = listCommits(scope.range)
   const affected = findAffected(commits, re)
 
-  console.log(`agent-be-gone`)
-  console.log(`  scope:        ${args.all ? 'ALL refs' : `branch "${branch}"`}`)
-  console.log(`  patterns:     ${patterns.join(', ')}`)
-  console.log(`  replace with: ${name} <${email}>`)
-  console.log(`  scanned:      ${commits.length} commit(s)`)
-  console.log(`  affected:     ${affected.length} commit(s)`)
-  console.log()
+  printPlan({ scope, patterns, identity, commits, affected })
 
-  if (affected.length === 0) {
-    console.log('Nothing to do — history is already clean. ✨')
-    return
-  }
+  if (!await shouldProceed(args, scope, affected)) return
 
-  for (const c of affected) {
-    const tags = []
-    if (c.inAuthor) tags.push('author')
-    if (c.inCommitter) tags.push('committer')
-    if (c.matchedTrailers.length) tags.push(`${c.matchedTrailers.length} trailer${c.matchedTrailers.length > 1 ? 's' : ''}`)
-    const subject = c.body.split('\n')[0]
-    console.log(`  ${c.hash.slice(0, 8)}  [${tags.join(', ')}]  ${c.an} <${c.ae}>  —  ${subject}`)
-  }
-  console.log()
-
-  if (args.dryRun) {
-    console.log('Dry run — no changes made.')
-    return
-  }
-
-  if (!args.yes) {
-    const ok = await confirm(`Rewrite ${affected.length} commit(s) on ${args.all ? 'all refs' : branch}?`)
-    if (!ok) { console.log('Aborted.'); return }
-  }
-
-  const envFilter = buildEnvFilter(patterns, name, email)
-  const msgFilter = buildMsgFilter(patterns)
-
-  const refs = args.all ? ['--all'] : [branch]
-  runFilterBranch(envFilter, msgFilter, refs)
+  runFilterBranch(buildEnvFilter(patterns, identity.name, identity.email), buildMsgFilter(patterns), scope.refs)
   cleanupBackups()
-
-  // Re-scan to confirm.
-  const after = findAffected(listCommits(range), re)
-  if (after.length === 0) {
-    console.log(`✓ History scrubbed. ${affected.length} commit(s) rewritten.`)
-  } else {
-    console.log(`⚠ ${after.length} commit(s) still match after rewrite — review manually.`)
-  }
-
-  if (args.push) {
-    const target = args.all ? '--all' : branch
-    console.log(`Pushing (force) → origin ${target}`)
-    const r = spawnSync('git', ['push', '--force', 'origin', target], { stdio: 'inherit' })
-    if (r.status !== 0) {
-      console.error('error: git push failed')
-      process.exit(r.status ?? 1)
-    }
-  } else {
-    console.log(`Next: review with \`git log\`, then \`git push --force\` when ready.`)
-  }
+  reportPostRewrite(scope.range, re, affected.length)
+  pushIfRequested(args, scope)
 }
 
 main().catch(err => { console.error(err.stack || err.message || err); process.exit(1) })

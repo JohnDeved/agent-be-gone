@@ -223,15 +223,14 @@ fi
 function buildMsgFilter (patterns) {
   // Drop Co-authored-by lines that match any pattern, then collapse
   // runs of trailing blank lines.
-  const re = patterns.join('|')
+  //
+  // We use `grep -Eiv` rather than awk for the filter step because
+  // BSD awk (the default on macOS) silently ignores `IGNORECASE` and
+  // doesn't support `\b` word boundaries — both of which the patterns
+  // rely on. `grep -E -i` handles both portably on BSD and GNU.
+  const re = `^Co-authored-by:.*(${patterns.join('|')})`
   const sq = (s) => `'${s.replace(/'/g, `'\\''`)}'`
-  return `awk -v re=${sq(re)} '
-    BEGIN { IGNORECASE = 1 }
-    /^Co-authored-by:/ {
-      if ($0 ~ re) next
-    }
-    { print }
-  ' | awk '
+  return `grep -Eiv -- ${sq(re)} | awk '
     { lines[NR] = $0 }
     END {
       n = NR
